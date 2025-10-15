@@ -1,0 +1,164 @@
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_squared_error, r2_score
+import numpy as np
+
+'''
+The main functions of this script include:
+1. Performing carbon balance correction for site-level data.
+2. Converting PFTs from character labels to corresponding numeric codes.
+3. Training the model and searching for optimal hyperparameters.
+4. Conducting spatial 10-fold cross-validation and exporting the results.
+
+'''
+
+
+igbp_codes = {
+    'ENF': 1,  # Evergreen Needleleaf Forest
+    'DBF': 4,  # Deciduous Broadleaf Forest
+    'EBF': 2,  # Evergreen Broadleaf Forest
+    'MF': 5,  # Mixed Forest
+    'CRO': 12,  # Cropland
+    'GRA': 10,  # Grassland
+    'WSA': 8,  # Wetland
+    'SAV': 9,  # Savanna
+    'OSH': 7,  # Open Shrubland
+    'CSH': 6,  # Closed Shrubland
+    'WET': 11  # Wetland
+}
+cols = ['dem', 'temperature_2m', 'soil_temperature_level_1', 'volumetric_soil_water_layer_1',
+        'solar_rad_dw','temperature_2m_min','temperature_2m_max',
+        'vpd','nirv', 'lai', 'sif','CO2','igbp_index']
+
+
+#carbon balance correction
+def carbon_balance_correction(path=r'FLUX_dataset.csv', outpath=r'FLUX_dataset_corr.csv'):
+
+    df = pd.read_csv(path)
+
+    # in-situ variables :'NEE_VUT_REF', 'GPP_NT_VUT_REF', 'RECO_NT_VUT_REF'
+    df['abs_diff'] = abs((df['GPP_NT_VUT_REF'] + df['NEE_VUT_REF'] - df['RECO_NT_VUT_REF']))
+    df['abs_per_diff'] = abs(df['abs_diff'] / df['NEE_VUT_REF'])
+    # The threshold of imbalance carbon
+    df = df[df['abs_diff'] < 0.1]
+    # The threshold of carbon imbalance ratio
+    df = df[df['abs_per_diff'] < 0.05]
+
+    # Correction
+    df['diff'] = df['GPP_NT_VUT_REF'] - df['RECO_NT_VUT_REF'] + df['NEE_VUT_REF']
+    df['GPP_NT_VUT_REF_RAT'] = df['GPP_NT_VUT_REF'] - df['diff'] * df['GPP_NT_VUT_REF'] / (
+                df['GPP_NT_VUT_REF'] + df['RECO_NT_VUT_REF'])
+    df['RECO_NT_VUT_REF_RAT'] = df['RECO_NT_VUT_REF'] + df['diff'] * df['RECO_NT_VUT_REF'] / (
+                df['GPP_NT_VUT_REF'] + df['RECO_NT_VUT_REF'])
+
+    # Exclude the values that do not conform to the actual physical meaning after correction
+    df = df[df['GPP_NT_VUT_REF_RAT'] >= 0]
+    df = df[df['RECO_NT_VUT_REF_RAT'] >= 0]
+    df.to_csv(outpath)
+    return df
+
+
+def pft_convert(df,outpath=r'FLUX_dataset_corr.csv'):
+    forest_types = ['ENF', 'DBF', 'EBF', 'MF', 'CRO', 'GRA', 'WSA', 'SAV', 'OSH', 'CSH', 'WET']
+    for igbp_type in forest_types:
+        df.loc[df['IGBP'] == igbp_type, 'igbp_index'] = igbp_codes[igbp_type]
+    df.to_csv(outpath)
+    return df
+
+
+def para_optimize(df):
+    X = df[cols]
+    y = df[['GPP_NT_VUT_REF_RAT', 'NEE_VUT_REF', 'RECO_NT_VUT_REF_RAT']]
+
+    # Note that the parameter values here are the initial Settings.
+    # The further adjustment process is specifically as follows:
+    # Based on the optimal parameters obtained each time, gradually narrow down the range of parameter Settings until the optimal combination is found.
+    # Avoiding setting too many parameter combinations at once during the initial setup is to improve efficiency
+    param_grid = {
+        'n_estimators': [100, 200, 300],
+        'max_depth': [10,20,30],
+        'min_samples_split': [4, 8, 16, 32],
+        'min_samples_leaf': [2, 4, 8, 16],
+        'bootstrap': [True]
+    }
+
+    rf = RandomForestRegressor(random_state=42)
+
+    grid_search = GridSearchCV(estimator=rf, param_grid=param_grid,
+                               cv=5, n_jobs=-1, verbose=2, scoring='neg_mean_squared_error')
+    grid_search.fit(X, y)
+    best_params = grid_search.best_params_
+    print(f"Best parameters found: {best_params}")
+
+    return best_params
+
+
+
+def validation(df,best_params,outpath):
+    X = df[cols]
+    y = df[['GPP_NT_VUT_REF_RAT', 'NEE_VUT_REF', 'RECO_NT_VUT_REF_RAT']]
+
+    sites = df['site'].unique()
+
+    kf = KFold(n_splits=10, shuffle=True, random_state=42)
+    folds = list(kf.split(sites))
+
+    all_predictions = pd.DataFrame()
+    fold = 1
+
+    for train_sites_idx, test_sites_idx in folds:
+        train_sites = sites[train_sites_idx]
+        test_sites = sites[test_sites_idx]
+
+        X_train = X[df['site'].isin(train_sites)]
+        y_train = y[df['site'].isin(train_sites)]
+        X_test = X[df['site'].isin(test_sites)]
+        y_test = y[df['site'].isin(test_sites)]
+
+        rf = RandomForestRegressor(n_estimators=best_params['n_estimators'], max_depth=best_params['max_depth'],
+                                   min_samples_split=best_params['min_samples_split'],
+                                   min_samples_leaf=best_params['min_samples_leaf'],
+                                   random_state=42)
+        rf.fit(X_train, y_train)
+        y_pred = rf.predict(X_test)
+
+        rmse = np.sqrt(mean_squared_error(y_test[:,0], y_pred[:,0]))
+        r2 = r2_score(y_test[:,0], y_pred[:,0])
+        print(f"GPP RMSE: {rmse:.4f}",f"R²: {r2:.4f}")
+        rmse = np.sqrt(mean_squared_error(y_test[:,1], y_pred[:,1]))
+        r2 = r2_score(y_test[:,1], y_pred[:,1])
+        print(f"NEE RMSE: {rmse:.4f}",f"R²: {r2:.4f}")
+        rmse = np.sqrt(mean_squared_error(y_test[:,2], y_pred[:,2]))
+        r2 = r2_score(y_test[:,2], y_pred[:,2])
+        print(f"RECO RMSE: {rmse:.4f}",f"R²: {r2:.4f}")
+
+        predictions = df[df['site'].isin(test_sites)].copy()
+        predictions['GPP_pred'] = y_pred[:, 0]
+        predictions['NEE_pred'] = y_pred[:, 1]
+        predictions['RECO_pred'] = y_pred[:, 2]
+        predictions['fold'] = fold
+
+        all_predictions = pd.concat([all_predictions, predictions], axis=0)
+
+        fold += 1
+
+
+    all_predictions.to_csv(outpath,index=False)
+
+    print(rf"The spatial 10-fold cross-validation has been completed, and the results of all folds have been saved to {outpath}")
+
+
+def main():
+    path=r'F:\CarbonSynEst\01_sitesvalues\FLUX_dataset.csv'
+    outpath = r'F:\CarbonSynEst\01_sitesvalues\FLUX_dataset_corr.csv'
+    vali_results_path = rf'F:\CarbonSynEst\01_sitesvalues\spatial_10_folds_cross_validation_results.csv'
+    data=carbon_balance_correction(path, outpath)
+    data=pft_convert(data,outpath)
+    params=para_optimize(data) # Please note that this step needs to be executed repeatedly. Based on the best parameter Settings obtained each time, narrow down the range of parameter search defined in the function until the best parameter combination is found
+    validation(data, params, vali_results_path)
+
+
+if __name__ == "__main__":
+    main()
